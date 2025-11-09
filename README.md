@@ -1,4 +1,5 @@
-<img width="2848" height="1600" alt="image_" src="https://github.com/user-attachments/assets/1c577352-6746-40b9-b778-ff85ade9f55a" />
+
+<img width="1000"  alt="image_" src="https://github.com/user-attachments/assets/0d966dde-f1d8-432f-bad0-aa79a5ccf396" />
 
 
 ### What this service is
