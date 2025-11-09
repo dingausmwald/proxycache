@@ -26,7 +26,7 @@ llama.cpp’s HTTP server exposes slot save/restore; saving writes a cache file 
 
 ### Quick start
 
-1) Start llama.cpp with slots and a cache directory:
+1) Start llama.cpp ( https://github.com/ggml-org/llama.cpp ) with slots and a cache directory:
 ```bash
 llama-server -m ./model.gguf -np 4 --slot-save-path /var/kvcache --host 0.0.0.0 --port 8080
 ```
@@ -40,6 +40,9 @@ python3 proxycache.py  # or: uvicorn app:app --host 0.0.0.0 --port 8081
 ```
 
 Your clients should call the proxy’s /v1/chat/completions endpoint; the proxy will handle similarity, slot selection, save/restore, and streaming vs non‑streaming automatically.
+
+
+If you run into issues using gpt-oss-20b with an IDE like Cline, follow these instructions: https://www.reddit.com/r/CLine/comments/1mtcj2v/making_gptoss_20b_and_cline_work_together/
 
 ### Parameters
 
