@@ -1,11 +1,13 @@
 # proxycache.py
 # -*- coding: utf-8 -*-
-# Запуск через: python3 proxycache.py
-import os
+
+"""
+Точка запуска uvicorn.
+"""
+
 import uvicorn
-from app import app  # FastAPI instance
+from app import app
+from config import PORT, LOG_LEVEL
 
 if __name__ == "__main__":
-    host = os.getenv("HOST", "0.0.0.0")
-    port = int(os.getenv("PORT", "8081"))
-    uvicorn.run(app, host=host, port=port, log_level="info")  # [web:107][web:137]
+    uvicorn.run(app, host="0.0.0.0", port=PORT, log_level=LOG_LEVEL.lower())
