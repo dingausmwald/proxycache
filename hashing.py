@@ -1,150 +1,98 @@
 # hashing.py
 # -*- coding: utf-8 -*-
+
+"""
+Raw-хэширование: raw_prefix без ролей, только контент, разделённый двойным переводом строки.
+Блоки по 100 слов, LCP по полным SHA256-хэшам. Key=sha256(raw_prefix).
+"""
+
 import os
-import re
+import json
 import hashlib
+import re
 import time
 import glob
-import json
-from typing import List, Dict, Optional
+import logging
+from typing import List, Dict, Optional, Tuple
 
-from config import SYSTEM_PROMPT_FILE, LOCAL_META_DIR
+from config import META_DIR, WORDS_PER_BLOCK
 
-# Гарантируем существование каталога для .meta (локальные метаданные прокси)
-os.makedirs(LOCAL_META_DIR, exist_ok=True)
+log = logging.getLogger(__name__)
 
-def normalize_content(content) -> str:
-    """
-    Нормализация OpenAI content:
-    - Если строка -> trim и вернуть.
-    - Если список частей -> взять только text-части и склеить пробелом.
-    - Иное -> привести к строке безопасно.
-    """
-    if content is None:
-        return ""
-    if isinstance(content, str):
-        return content.strip()
-    if isinstance(content, list):
-        parts = []
-        for p in content:
-            # Ожидаемые элементы: {"type":"text","text":"..."} или {"type":"image_url", ...}
-            if isinstance(p, dict) and p.get("type") == "text":
-                t = p.get("text")
-                if isinstance(t, str):
-                    t = t.strip()
-                    if t:
-                        parts.append(t)
-        return " ".join(parts).strip()
-    # На всякий случай: нестроковые типы
-    try:
-        return str(content).strip()
-    except Exception:
-        return ""
-
-def canonical_chat_prefix(messages: Optional[List[Dict]],
-                          system_prompt_file: Optional[str] = SYSTEM_PROMPT_FILE,
-                          add_bos: bool = True) -> str:
-    """
-    Канонически сериализует чат в строку префикса:
-    - BOS (опционально),
-    - системный промпт из файла (если задан),
-    - последовательность ролей с нормализованным content,
-    - маркер начала ответа ассистента.
-    """
-    parts: List[str] = []
-    if add_bos:
-        parts.append("<|bos|>\n")
-
-    if system_prompt_file and os.path.exists(system_prompt_file):
-        with open(system_prompt_file, "r", encoding="utf-8") as f:
-            sys_text = f.read().strip()
-        if sys_text:
-            parts.append(f"<|system|>\n{sys_text}\n")
-
-    for m in messages or []:
-        role = m.get("role", "user")
-        raw = m.get("content")
-        content = normalize_content(raw)
-        if role == "system" and content:
-            parts.append(f"<|system|>\n{content}\n")
-        elif role == "assistant":
-            parts.append(f"<|assistant|>\n{content}\n")
-        elif role == "user":
-            parts.append(f"<|user|>\n{content}\n")
+def raw_prefix(messages: List[Dict]) -> str:
+    parts = []
+    for msg in messages or []:
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            content = content.strip()
         else:
-            parts.append(f"<|user:{role}|>\n{content}\n")
-
-    parts.append("<|assistant|>\n")
-    return "".join(parts)
+            content = str(content).strip()
+        if content:
+            parts.append(content)
+    # Без ролей, разделитель — пустая строка между репликами
+    text = "\n\n".join(parts).strip()
+    log.debug("raw_prefix len_chars=%d", len(text))
+    return text
 
 def words_from_text(text: str) -> List[str]:
-    # Деление по пробельным символам; убираем пустые
-    return [w for w in re.split(r"\s+", text.strip()) if w]
+    return re.findall(r'\w+', text.lower())
 
-def block_hashes_from_text(text: str, words_per_block: int) -> List[str]:
-    """
-    Делим текст на блоки по N словам и считаем SHA-256 каждого блока — эвристика LCP без токенизации.
-    """
-    ws = words_from_text(text)
-    blocks: List[str] = []
-    for i in range(0, len(ws), words_per_block):
-        block_words = ws[i:i+words_per_block]
-        block_text = " ".join(block_words)
-        h = hashlib.sha256(block_text.encode("utf-8")).hexdigest()
-        blocks.append(h)
-    return blocks
+def block_hashes_from_text(text: str, wpb: int = WORDS_PER_BLOCK) -> List[str]:
+    words = words_from_text(text)
+    hashes = []
+    for i in range(0, len(words), wpb):
+        block = " ".join(words[i:i+wpb])
+        h = hashlib.sha256(block.encode("utf-8")).hexdigest()
+        hashes.append(h)
+    log.debug("block_hashes n_blocks=%d wpb=%d", len(hashes), wpb)
+    return hashes
 
-def lcp_blocks(a: List[str], b: List[str]) -> int:
-    """
-    Длина общего префикса по блокам (в блоках).
-    """
-    n = min(len(a), len(b))
+def lcp_blocks(blocks1: List[str], blocks2: List[str]) -> int:
+    n = min(len(blocks1), len(blocks2))
     i = 0
-    while i < n and a[i] == b[i]:
+    while i < n and blocks1[i] == blocks2[i]:
         i += 1
     return i
 
-def prefix_key_sha256(prefix_text: str) -> str:
-    """
-    Ключ префикса — SHA-256 от канонической строки чата.
-    """
-    return hashlib.sha256(prefix_text.encode("utf-8")).hexdigest()
+def prefix_key_sha256(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
-def meta_filename_for_key_local(key: str) -> str:
-    """
-    Путь к локальному .meta для ключа (хранится у прокси, не в --slot-save-path сервера).
-    """
-    return os.path.join(LOCAL_META_DIR, f"slotcache_{key}.meta.json")
+def scan_all_meta() -> List[Dict]:
+    files = sorted(glob.glob(os.path.join(META_DIR, "*.meta.json")), key=os.path.getmtime, reverse=True)
+    metas = []
+    for f in files:
+        try:
+            with open(f, "r", encoding="utf-8") as fd:
+                meta = json.load(fd)
+                metas.append(meta)
+        except Exception as e:
+            log.warning("scan_meta_fail %s: %s", f, e)
+    log.debug("scan_meta n_found=%d", len(metas))
+    return metas
 
-def write_meta_for_key_local(key: str,
-                             prefix_text: str,
-                             model_id: str,
-                             words_per_block: int,
-                             block_hashes: List[str]) -> None:
-    """
-    Запись локальной .meta: ключ, модель, длина префикса, размер блока, список хешей блоков.
-    """
+def find_best_restore_candidate(req_blocks: List[str], wpb: int, th: float) -> Optional[Tuple[str, float]]:
+    metas = scan_all_meta()
+    best_key, best_ratio = None, 0.0
+    for meta in metas:
+        if int(meta.get("wpb") or 0) != wpb:
+            continue
+        cand_blocks = meta.get("blocks") or []
+        lcp = lcp_blocks(req_blocks, cand_blocks)
+        denom = max(1, min(len(req_blocks), len(cand_blocks)))
+        ratio = lcp / denom
+        if ratio >= th and ratio > best_ratio:
+            best_ratio = ratio
+            best_key = meta.get("key")
+    return (best_key, best_ratio) if best_key else None
+
+def write_meta(key: str, prefix_text: str, blocks: List[str], wpb: int):
     meta = {
         "key": key,
-        "model_id": model_id,
-        "prefix_len_chars": len(prefix_text),
-        "blocks": block_hashes,
-        "words_per_block": words_per_block,
-        "updated_at": int(time.time()),
+        "prefix_len": len(prefix_text),
+        "wpb": wpb,
+        "blocks": blocks,
+        "timestamp": time.time(),
     }
-    with open(meta_filename_for_key_local(key), "w", encoding="utf-8") as f:
-        json.dump(meta, f, ensure_ascii=False)
-
-def scan_all_meta_local(limit: int) -> List[Dict]:
-    """
-    Чтение последних .meta из каталога LOCAL_META_DIR (для выбора лучшего restore-кандидата).
-    """
-    files = sorted(glob.glob(os.path.join(LOCAL_META_DIR, "slotcache_*.meta.json")), reverse=True)
-    metas: List[Dict] = []
-    for p in files[:limit]:
-        try:
-            with open(p, "r", encoding="utf-8") as f:
-                metas.append(json.load(f))
-        except Exception:
-            continue
-    return metas  # ВАЖНО: без опечаток
+    path = os.path.join(META_DIR, f"{key}.meta.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2, ensure_ascii=False)
