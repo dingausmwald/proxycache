@@ -5,15 +5,17 @@
 """
 Simple KV Proxy:
 
-- Большие: LCP → restore на свободный/старый слот, затем чат строго в этот же слот, потом save+meta.
+- Большие: LCP→restore на свободный/старый слот, затем чат строго в этот же слот, потом save+meta.
 - Малые: свободный/старый слот, без restore и без дискового save/meta.
 - Пин slota дублируется в root/options/query (через клиента).
+- Ключи кеша и мета завязаны на model_id, полученный от llama.cpp,
+  но /v1/models прокси по-прежнему отдаёт MODEL_ID из конфигурации.
 """
 
 import asyncio
 import time
 import logging
-from typing import List, Dict, AsyncGenerator
+from typing import List, Dict, AsyncGenerator, Optional
 
 import httpx
 from fastapi import FastAPI, Request
@@ -48,6 +50,7 @@ async def shutdown():
 
 @app.get("/v1/models")
 async def models():
+    # Внешний API: всегда отдаём MODEL_ID, как и раньше
     return {"data": [{"id": MODEL_ID}]}
 
 
@@ -57,6 +60,7 @@ async def stream_bytes_gen(
     key: str,
     prefix: str,
     blocks: List[str],
+    model_id: str,
     sm: SlotManager,
     is_big: bool,
 ) -> AsyncGenerator[bytes, None]:
@@ -73,11 +77,14 @@ async def stream_bytes_gen(
         # После завершения стрима сохраняем только большие запросы
         ok = await sm.save_after(g, key, is_big=is_big)
         if is_big:
-            hs.write_meta(key, prefix, blocks, WORDS_PER_BLOCK)
+            hs.write_meta(key, prefix, blocks, WORDS_PER_BLOCK, model_id)
         sm.release(g)
         log.info(
             "stream_done g=%s key=%s saved=%s is_big=%s",
-            g, key[:16], ok, is_big,
+            g,
+            key[:16],
+            ok,
+            is_big,
         )
 
 
@@ -91,30 +98,47 @@ async def chat(req: Request):
 
     messages: List[Dict] = data.get("messages") or []
     stream = bool(data.get("stream", False))
-    model = data.get("model") or MODEL_ID
+    client_model = data.get("model") or MODEL_ID
+
+    # model_id для кеша берём у первого backend'а (предполагается, что все backends одинаковые)
+    # Это id из самого llama.cpp, а не клиентское имя модели.
+    backend_model_id = await clients[0].get_model_id()
 
     prefix = hs.raw_prefix(messages)
-    key = hs.prefix_key_sha256(prefix)
+    # Ключ завязан и на модель, и на префикс
+    full_for_key = backend_model_id + "\n" + prefix
+    key = hs.prefix_key_sha256(full_for_key)
+
     blocks = hs.block_hashes_from_text(prefix, WORDS_PER_BLOCK)
     n_words = len(hs.words_from_text(prefix))
     is_big = n_words > BIG_THRESHOLD_WORDS
 
     restore_key: Optional[str] = None
     if is_big:
-        cand = hs.find_best_restore_candidate(blocks, WORDS_PER_BLOCK, LCP_TH)
+        cand = hs.find_best_restore_candidate(
+            blocks,
+            WORDS_PER_BLOCK,
+            LCP_TH,
+            backend_model_id,
+        )
         if cand:
             restore_key, ratio = cand
             log.info(
                 "restore_candidate basename=%s ratio=%.3f",
-                restore_key[:16], ratio,
+                restore_key[:16],
+                ratio,
             )
         else:
             log.info("restore_candidate none")
     else:
-        log.info("small_request n_words=%d threshold=%d",
-                 n_words, BIG_THRESHOLD_WORDS)
+        log.info(
+            "small_request n_words=%d threshold=%d",
+            n_words,
+            BIG_THRESHOLD_WORDS,
+        )
 
     # Получаем слот: логика выбора + обязательный save при эвикте для больших внутри SlotManager
+    # (предполагается обновлённый SlotManager.acquire_for_request(is_big, restore_key))
     g, lock, restored = await sm.acquire_for_request(
         is_big=is_big,
         restore_key=restore_key if is_big else None,
@@ -125,7 +149,8 @@ async def chat(req: Request):
 
     # Формируем тело: корневые флаги для cache_prompt и n_keep
     body = dict(data)
-    body["model"] = model
+    # Наружу используем клиентскую модель или MODEL_ID, как и раньше
+    body["model"] = client_model
     body["cache_prompt"] = bool(is_big)
     body["n_keep"] = -1
 
@@ -137,17 +162,22 @@ async def chat(req: Request):
     body["options"] = opts
 
     log.info(
-        "dispatch be=%d slot=%d is_big=%s (restore_target=%s restored=%s)",
+        "dispatch be=%d slot=%d is_big=%s (restore_target=%s restored=%s model_id=%s)",
         be_id,
         slot_id,
         is_big,
         restore_key[:16] if restore_key else None,
         restored,
+        backend_model_id,
     )
 
     try:
         if stream:
-            resp = await client.chat_completions(body, slot_id=slot_id, stream=True)
+            resp = await client.chat_completions(
+                body,
+                slot_id=slot_id,
+                stream=True,
+            )
             if resp.status_code != 200:
                 err_txt = await resp.aread()
                 await resp.aclose()
@@ -164,6 +194,7 @@ async def chat(req: Request):
                     key,
                     prefix,
                     blocks,
+                    backend_model_id,
                     sm,
                     is_big=is_big,
                 ):
@@ -180,7 +211,11 @@ async def chat(req: Request):
             )
 
         else:
-            out = await client.chat_completions(body, slot_id=slot_id, stream=False)
+            out = await client.chat_completions(
+                body,
+                slot_id=slot_id,
+                stream=False,
+            )
             if not isinstance(out, dict):
                 sm.release(g)
                 return JSONResponse(
@@ -191,7 +226,13 @@ async def chat(req: Request):
             # После нестримового ответа сохраняем только большие запросы
             ok = await sm.save_after(g, key, is_big=is_big)
             if is_big:
-                hs.write_meta(key, prefix, blocks, WORDS_PER_BLOCK)
+                hs.write_meta(
+                    key,
+                    prefix,
+                    blocks,
+                    WORDS_PER_BLOCK,
+                    backend_model_id,
+                )
             sm.release(g)
             log.info(
                 "json_done g=%s key=%s saved=%s is_big=%s dur_ms=%d",

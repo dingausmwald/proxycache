@@ -4,10 +4,17 @@
 
 """
 Raw-хэширование: raw_prefix без ролей, только контент, разделённый двойным переводом строки.
-Блоки по 100 слов, LCP по полным SHA256-хэшам. Key=sha256(raw_prefix).
 
-Добавлено:
-- touch_meta(key): обновляет timestamp в существующем meta-файле, не меняя blocks и prefix_len.
+Блоки по 100 слов, LCP по полным SHA256-хэшам.
+Key = sha256(model_id + "\n" + raw_prefix), т.е. модель включена в ключ.
+
+Метафайлы содержат:
+- key
+- model_id
+- prefix_len
+- wpb
+- blocks
+- timestamp
 """
 
 import os
@@ -64,6 +71,9 @@ def lcp_blocks(blocks1: List[str], blocks2: List[str]) -> int:
 
 
 def prefix_key_sha256(text: str) -> str:
+    """
+    Базовая SHA256-обёртка; для кеша в неё передаём model_id + "\n" + raw_prefix.
+    """
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
@@ -89,18 +99,30 @@ def find_best_restore_candidate(
     req_blocks: List[str],
     wpb: int,
     th: float,
+    model_id: str,
 ) -> Optional[Tuple[str, float]]:
+    """
+    Ищет лучший кандидат для restore среди мета-файлов ТОЛЬКО текущей модели.
+
+    Фильтруем по:
+    - meta["model_id"] == model_id
+    - meta["wpb"] == wpb
+    """
     metas = scan_all_meta()
     best_key: Optional[str] = None
     best_ratio = 0.0
 
     for meta in metas:
+        if meta.get("model_id") != model_id:
+            continue
         if int(meta.get("wpb") or 0) != wpb:
             continue
+
         cand_blocks = meta.get("blocks") or []
         lcp = lcp_blocks(req_blocks, cand_blocks)
         denom = max(1, min(len(req_blocks), len(cand_blocks)))
         ratio = lcp / denom
+
         if ratio >= th and ratio > best_ratio:
             best_ratio = ratio
             best_key = meta.get("key")
@@ -108,9 +130,19 @@ def find_best_restore_candidate(
     return (best_key, best_ratio) if best_key else None
 
 
-def write_meta(key: str, prefix_text: str, blocks: List[str], wpb: int):
+def write_meta(
+    key: str,
+    prefix_text: str,
+    blocks: List[str],
+    wpb: int,
+    model_id: str,
+) -> None:
+    """
+    Записывает/перезаписывает meta-файл для key, привязанный к конкретной модели.
+    """
     meta = {
         "key": key,
+        "model_id": model_id,
         "prefix_len": len(prefix_text),
         "wpb": wpb,
         "blocks": blocks,
