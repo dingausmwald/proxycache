@@ -68,27 +68,25 @@ class SlotManager:
     async def acquire_for_request(
         self,
         restore_key: Optional[str] = None,
+        model_id: Optional[str] = None,
     ) -> Tuple[GSlot, asyncio.Lock, Optional[bool]]:
         g, lock = self._get_free_or_oldest()
         await lock.acquire()
-
         restored: Optional[bool] = None
         if restore_key:
             client = self.backends[g[0]]["client"]
-            restored = await client.restore_slot(g[1], restore_key)
+            restored = await client.restore_slot(g[1], restore_key, model_id)
             log.info(
                 "restore_before_chat g=%s key=%s ok=%s",
                 g,
                 (restore_key[:16] if restore_key else None),
                 restored,
             )
-
         return g, lock, restored
 
-    async def save_after(self, g: GSlot, key: str) -> bool:
+    async def save_after(self, g: GSlot, key: str, model_id: Optional[str] = None) -> bool:
         client = self.backends[g[0]]["client"]
-        ok = await client.save_slot(g[1], key)
-        self._last_used[g] = time.time()
+        ok = await client.save_slot(g[1], key, model_id)
         return ok
 
     def release(self, g: GSlot):
