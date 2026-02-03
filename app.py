@@ -29,14 +29,11 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 
-from config import (
-    BACKENDS,
-    BIG_THRESHOLD_WORDS,
-    LCP_TH,
-    MODEL_ID,
-    WORDS_PER_BLOCK,
-    PORT,
-)
+from config import (BACKENDS, WORDS_PER_BLOCK, BIG_THRESHOLD_WORDS, 
+                    LCP_TH, META_DIR, MODEL_ID, PORT,
+                    CACHE_DIR, CACHE_MAX_AGE_HOURS, CACHE_MAX_SIZE_GB, 
+                    CACHE_CLEANUP_INTERVAL_MINUTES)
+                    
 import hashing as hs
 from llama_client import LlamaClient
 from slot_manager import SlotManager, GSlot
@@ -48,6 +45,17 @@ STREAM_QUEUE_SIZE = 16
 
 app = FastAPI(title="Simple KV Proxy")
 
+async def periodic_cleanup():
+    """Run cache cleanup periodically."""
+    import hashing as hs
+    while True:
+        try:
+            await asyncio.sleep(CACHE_CLEANUP_INTERVAL_MINUTES * 60)
+            log.info("cleanup_start: max_age=%dh max_size=%.1fGB", 
+                     CACHE_MAX_AGE_HOURS, CACHE_MAX_SIZE_GB)
+            hs.cleanup_old_cache(CACHE_DIR, META_DIR, CACHE_MAX_AGE_HOURS, CACHE_MAX_SIZE_GB)
+        except Exception as e:
+            log.error("cleanup_error: %s", e)
 
 @app.on_event("startup")
 async def startup():
@@ -57,7 +65,8 @@ async def startup():
     app.state.clients = clients
     app.state.sm = sm
     log.info("app_start n_backends=%d port=%d", len(BACKENDS), PORT)
-
+    if CACHE_DIR:
+        asyncio.create_task(periodic_cleanup())
 
 @app.on_event("shutdown")
 async def shutdown():
@@ -107,6 +116,8 @@ async def start_stream_task(
             ok = False
             try:
                 ok = await sm.save_after(g, key, model_id)
+            except asyncio.CancelledError:
+                log.warning("save_after_cancelled g=%s key=%s", g, key[:16])
             except Exception as e:
                 log.warning("save_after_exception g=%s key=%s: %s", g, key[:16], e)
             try:
@@ -117,17 +128,31 @@ async def start_stream_task(
             log.info("stream_reader_done g=%s key=%s saved=%s", g, key[:16], ok)
             try:
                 await queue.put(None)
+            except asyncio.CancelledError:
+                pass
             except Exception:
                 pass
 
-    asyncio.create_task(reader())
+    task = asyncio.create_task(reader())
 
     async def gen() -> AsyncGenerator[bytes, None]:
-        while True:
-            item = await queue.get()
-            if item is None:
-                break
-            yield item
+        try:
+            while True:
+                item = await queue.get()
+                if item is None:
+                    break
+                yield item
+        except asyncio.CancelledError:
+            log.warning("gen_cancelled, cancelling reader task")
+            task.cancel()
+            raise
+        finally:
+            if not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
 
     return gen()
 
