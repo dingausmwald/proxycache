@@ -173,3 +173,89 @@ def touch_meta(key: str) -> None:
         log.warning("touch_meta_missing key=%s", key[:16])
     except Exception as e:
         log.warning("touch_meta_fail key=%s: %s", key[:16], e)
+
+def cleanup_old_cache(
+    cache_dir: str,
+    meta_dir: str,
+    max_age_hours: int = 168,
+    max_size_gb: float = 50.0,
+) -> Dict[str, int]:
+    """
+    Cleanup old cache files based on age and total size.
+    Returns stats: {"deleted_by_age": N, "deleted_by_size": N, "total_freed_bytes": N}
+    """
+    import time
+    
+    stats = {"deleted_by_age": 0, "deleted_by_size": 0, "total_freed_bytes": 0}
+    
+    if not cache_dir or not os.path.isdir(cache_dir):
+        log.warning("cleanup_skip: cache_dir not set or doesn't exist: %s", cache_dir)
+        return stats
+    
+    now = time.time()
+    max_age_seconds = max_age_hours * 3600 if max_age_hours > 0 else float('inf')
+    max_size_bytes = max_size_gb * 1024 * 1024 * 1024
+    
+    # Get all cache files with their stats
+    cache_files = []
+    for f in os.listdir(cache_dir):
+        filepath = os.path.join(cache_dir, f)
+        if os.path.isfile(filepath):
+            try:
+                stat = os.stat(filepath)
+                cache_files.append({
+                    "path": filepath,
+                    "basename": f,
+                    "size": stat.st_size,
+                    "mtime": stat.st_mtime,
+                })
+            except OSError:
+                continue
+    
+    # Delete by age
+    for cf in cache_files[:]:
+        if now - cf["mtime"] > max_age_seconds:
+            try:
+                os.remove(cf["path"])
+                stats["deleted_by_age"] += 1
+                stats["total_freed_bytes"] += cf["size"]
+                cache_files.remove(cf)
+                # Also remove meta file
+                meta_path = os.path.join(meta_dir, f"{cf['basename']}.meta.json")
+                if os.path.exists(meta_path):
+                    os.remove(meta_path)
+                log.info("cleanup_age: deleted %s (age: %.1f hours)", 
+                        cf["basename"][:16], (now - cf["mtime"]) / 3600)
+            except OSError as e:
+                log.warning("cleanup_age_fail: %s: %s", cf["basename"][:16], e)
+    
+    # Calculate current total size
+    total_size = sum(cf["size"] for cf in cache_files)
+    
+    # Delete by size (oldest first) until under limit
+    if total_size > max_size_bytes:
+        # Sort by mtime (oldest first)
+        cache_files.sort(key=lambda x: x["mtime"])
+        
+        for cf in cache_files:
+            if total_size <= max_size_bytes:
+                break
+            try:
+                os.remove(cf["path"])
+                stats["deleted_by_size"] += 1
+                stats["total_freed_bytes"] += cf["size"]
+                total_size -= cf["size"]
+                # Also remove meta file
+                meta_path = os.path.join(meta_dir, f"{cf['basename']}.meta.json")
+                if os.path.exists(meta_path):
+                    os.remove(meta_path)
+                log.info("cleanup_size: deleted %s (freed: %.1f MB)", 
+                        cf["basename"][:16], cf["size"] / 1024 / 1024)
+            except OSError as e:
+                log.warning("cleanup_size_fail: %s: %s", cf["basename"][:16], e)
+    
+    log.info("cleanup_done: deleted_by_age=%d deleted_by_size=%d freed=%.1f MB",
+             stats["deleted_by_age"], stats["deleted_by_size"], 
+             stats["total_freed_bytes"] / 1024 / 1024)
+    
+    return stats
