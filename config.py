@@ -47,6 +47,12 @@ MODEL_ID = os.getenv("MODEL_ID", "llama.cpp")
 # Service port
 PORT = int(os.getenv("PORT", "8081"))
 
+# Cache cleanup settings
+CACHE_DIR = os.getenv("CACHE_DIR", "")  # llama.cpp --slot-save-path directory
+CACHE_MAX_AGE_HOURS = int(os.getenv("CACHE_MAX_AGE_HOURS", "168"))  # 7 days default
+CACHE_MAX_SIZE_GB = float(os.getenv("CACHE_MAX_SIZE_GB", "50"))  # 50 GB default
+CACHE_CLEANUP_INTERVAL_MINUTES = int(os.getenv("CACHE_CLEANUP_INTERVAL_MINUTES", "60"))  # hourly
+
 # Logs
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 logging.basicConfig(
