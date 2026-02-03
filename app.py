@@ -68,7 +68,8 @@ async def shutdown():
 
 @app.get("/v1/models")
 async def models():
-    return {"data": [{"id": MODEL_ID}]}
+    resp = await app.state.clients[0].client.get("/v1/models")
+    return resp.json()
 
 
 async def start_stream_task(
@@ -105,7 +106,7 @@ async def start_stream_task(
                 pass
             ok = False
             try:
-                ok = await sm.save_after(g, key)
+                ok = await sm.save_after(g, key, model_id)
             except Exception as e:
                 log.warning("save_after_exception g=%s key=%s: %s", g, key[:16], e)
             try:
@@ -142,9 +143,8 @@ async def chat(req: Request):
     messages: List[Dict] = data.get("messages") or []
     stream = bool(data.get("stream", False))
     client_model = data.get("model") or MODEL_ID
-
-    # model_id берём у первого backend'а
-    backend_model_id = await clients[0].get_model_id()
+    # model_id aus dem Request nehmen, nicht von /v1/models
+    backend_model_id = client_model
 
     prefix = hs.raw_prefix(messages)
     full_for_key = backend_model_id + "\n" + prefix
@@ -185,7 +185,7 @@ async def chat(req: Request):
 
     try:
         g, lock, restored = await asyncio.wait_for(
-            sm.acquire_for_request(restore_key if is_big else None),
+            sm.acquire_for_request(restore_key if is_big else None, backend_model_id),
             timeout=ACQUIRE_TIMEOUT,
         )
     except asyncio.TimeoutError:
@@ -278,7 +278,7 @@ async def chat(req: Request):
             ok = False
             try:
                 if is_big:
-                    ok = await sm.save_after(g, key)
+                    ok = await sm.save_after(g, key, backend_model_id)
                     hs.write_meta(
                         key,
                         prefix,
